@@ -1,0 +1,112 @@
+{
+  "name": "VoltEdge · 03 Daily Summary",
+  "nodes": [
+    {
+      "id": "3e157b0f-1958-44d8-9163-a94317153831",
+      "name": "Every day at 8pm",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        300
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 20 * * *"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "ef22e1de-9b4d-44c8-8a53-8fcd1175c95c",
+      "name": "Today's Numbers",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        220,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- All orders created today (Lagos time)\nselect\n  count(*)::int                                                                   as total_orders,\n  coalesce(sum(total_amount) filter (where order_status <> 'INCOMPLETE'), 0)::float8 as total_value,\n  count(*) filter (where 'HIGH_VALUE_ORDER' = any(tags))::int                     as high_value_orders,\n  count(*) filter (where payment_status = 'PAYMENT_PENDING'\n                     and order_status in ('RECEIVED','UNDER_REVIEW'))::int        as awaiting_payment,\n  count(*) filter (where payment_status = 'PAYMENT_CONFIRMED')::int               as paid_orders,\n  coalesce(sum(amount_paid) filter (where payment_status = 'PAYMENT_CONFIRMED'), 0)::float8 as total_paid,\n  count(*) filter (where bonus_status = 'PENDING_PAYMENT')::int                   as bonuses_pending,\n  coalesce(sum(bonus_amount) filter (where bonus_status = 'PENDING_PAYMENT'), 0)::float8 as bonus_value_pending,\n  count(*) filter (where order_status = 'UNDER_REVIEW')::int                      as under_review,\n  count(*) filter (where order_status = 'INCOMPLETE')::int                        as incomplete\nfrom orders\nwhere created_at >= (date_trunc('day', now() at time zone 'Africa/Lagos') at time zone 'Africa/Lagos');",
+        "options": {}
+      }
+    },
+    {
+      "id": "aacfc9f9-9329-47c0-9ff1-2b630f611f78",
+      "name": "Format Report",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        440,
+        300
+      ],
+      "parameters": {
+        "jsCode": "// ─────────────────────────────────────────────────────────────\n// NODE: \"Format Report\"   (Code node · Run Once for All Items)\n// Workflow 03. Turns today's numbers into a Telegram message.\n// ─────────────────────────────────────────────────────────────\nconst s = $input.first().json;\nconst naira = (n) => '₦' + Number(n).toLocaleString('en-NG');\nconst today = new Date().toLocaleDateString('en-NG', { timeZone: 'Africa/Lagos', dateStyle: 'full' });\n\nconst text = [\n  `📊 <b>VoltEdge daily summary</b>`,\n  today,\n  '',\n  `<b>Orders received:</b> ${s.total_orders}`,\n  `<b>Total order value:</b> ${naira(s.total_value)}`,\n  `<b>High-value orders:</b> ${s.high_value_orders}`,\n  `<b>Awaiting payment:</b> ${s.awaiting_payment}`,\n  `<b>Paid today:</b> ${s.paid_orders} (${naira(s.total_paid)})`,\n  `<b>Bonuses pending verification:</b> ${s.bonuses_pending} (${naira(s.bonus_value_pending)})`,\n  `<b>Under review:</b> ${s.under_review}`,\n  `<b>Incomplete submissions:</b> ${s.incomplete}`,\n].join('\\n');\n\nreturn [{ json: { ...s, telegram_text: text } }];\n"
+      }
+    },
+    {
+      "id": "b508ca55-fad5-4b0a-890c-c344f1243b56",
+      "name": "Send to Team",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        660,
+        300
+      ],
+      "onError": "continueRegularOutput",
+      "parameters": {
+        "chatId": "YOUR_TELEGRAM_CHAT_ID",
+        "text": "={{ $json.telegram_text }}",
+        "additionalFields": {
+          "appendAttribution": false,
+          "parse_mode": "HTML"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Every day at 8pm": {
+      "main": [
+        [
+          {
+            "node": "Today's Numbers",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Today's Numbers": {
+      "main": [
+        [
+          {
+            "node": "Format Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Report": {
+      "main": [
+        [
+          {
+            "node": "Send to Team",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "Africa/Lagos"
+  },
+  "pinData": {}
+}

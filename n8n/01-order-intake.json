@@ -1,0 +1,538 @@
+{
+  "name": "VoltEdge · 01 Order Intake",
+  "nodes": [
+    {
+      "id": "4f990b16-9588-4f31-81e4-c11b162f7a43",
+      "name": "Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        300
+      ],
+      "webhookId": "283369e7-1c83-4e75-96eb-e0f86ee7b961",
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "voltedge-order",
+        "options": {},
+        "authentication": "headerAuth",
+        "responseMode": "responseNode"
+      }
+    },
+    {
+      "id": "b844ad16-222d-4864-9ec7-5672c0425c69",
+      "name": "Normalize Input",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        220,
+        300
+      ],
+      "parameters": {
+        "jsCode": "// ─────────────────────────────────────────────────────────────\n// NODE: \"Normalize Input\"   (Code node · Run Once for All Items)\n// Cleans what the website sent so every later step can rely on it.\n// It does NOT decide whether the order is valid — \"Process Order\" does.\n// ─────────────────────────────────────────────────────────────\nconst body = $input.first().json.body ?? {};\nconst customer = body.customer ?? {};\nconst clean = (v) => (typeof v === 'string' ? v.trim().replace(/\\s+/g, ' ') : '');\n\n// Merge repeated products (2 lines of the same mouse → 1 line, qty 2)\nconst merged = {};\nlet blankLines = 0;\nfor (const line of Array.isArray(body.items) ? body.items : []) {\n  const id = clean(String(line?.productId ?? '')).toLowerCase();\n  if (!id) { blankLines++; continue; }\n  merged[id] = (merged[id] ?? 0) + Number(line?.quantity);   // NaN is caught in Process Order\n}\nconst items = Object.entries(merged).map(([productId, quantity]) => ({ productId, quantity }));\n\n// A fingerprint of the cart, used to spot accidental double submissions\nconst signature = items.map((i) => `${i.productId}:${i.quantity}`).sort().join('|');\n\nreturn [{\n  json: {\n    name: clean(customer.name),\n    email: clean(customer.email).toLowerCase(),\n    phone: clean(customer.phone),\n    items,\n    blank_lines: blankLines,\n    product_ids: items.map((i) => i.productId),\n    signature,\n    received_at: new Date().toISOString(),\n    raw: body,\n  },\n}];\n"
+      }
+    },
+    {
+      "id": "add97f5e-36e6-4ab5-ad2d-9599f3f27743",
+      "name": "Get Products",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        440,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Look up only the products in this order. Always returns exactly one row.\nselect coalesce(jsonb_agg(to_jsonb(p)), '[]'::jsonb) as products\nfrom products p\nwhere p.id in (select jsonb_array_elements_text($1::jsonb));",
+        "options": {
+          "queryReplacement": "={{ [ JSON.stringify($json.product_ids) ] }}"
+        }
+      }
+    },
+    {
+      "id": "796d8d6f-2a59-49ff-8eba-4e07bbe3c19b",
+      "name": "Get Customer History",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        660,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Customer history for returning-customer + duplicate checks. Always returns one row.\nselect\n  count(*) filter (where order_status <> 'INCOMPLETE')::int                       as previous_orders,\n  count(*) filter (where payment_status = 'PAYMENT_CONFIRMED')::int               as paid_orders,\n  coalesce(sum(total_amount) filter (where payment_status = 'PAYMENT_CONFIRMED'), 0)::float8 as lifetime_paid,\n  count(*) filter (where items_signature = $2\n                     and order_status <> 'INCOMPLETE'\n                     and created_at > now() - interval '10 minutes')::int         as recent_duplicates,\n  (array_agg(customer_phone order by created_at desc)\n     filter (where order_status <> 'INCOMPLETE'))[1]                              as last_phone\nfrom orders\nwhere $1 <> '' and lower(customer_email) = lower($1);",
+        "options": {
+          "queryReplacement": "={{ [ $('Normalize Input').first().json.email, $('Normalize Input').first().json.signature ] }}"
+        }
+      }
+    },
+    {
+      "id": "d31cde49-55a6-441c-b5df-afcd75648d32",
+      "name": "Process Order",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        880,
+        300
+      ],
+      "parameters": {
+        "jsCode": "// ─────────────────────────────────────────────────────────────\n// NODE: \"Process Order\"   (Code node · Run Once for All Items)\n// All business rules live here, in plain deterministic code:\n//   validation → pricing from the DATABASE → 5% bonus rule →\n//   review checks → customer type → tags → order reference.\n// No AI is involved in any number or status.\n// ─────────────────────────────────────────────────────────────\nconst BONUS_THRESHOLD = 500000;      // ₦500,000\nconst BONUS_RATE = 0.05;             // 5% store credit\nconst MAX_QTY_PER_ITEM = 5;          // above this → manual review\nconst UNUSUAL_ORDER_VALUE = 10000000; // ₦10m → manual review\nconst VIP_LIFETIME_PAID = 3000000;   // ₦3m paid in total → VIP\nconst VIP_PAID_ORDERS = 3;           // or 3+ paid orders → VIP\n\nconst input = $('Normalize Input').first().json;\nconst productRows = $('Get Products').first().json.products ?? [];\nconst history = $('Get Customer History').first().json ?? {};\n\nconst errors = [];    // missing/invalid info  → INCOMPLETE_ORDER\nconst warnings = [];  // valid but suspicious  → REVIEW_REQUIRED\nconst tags = new Set();\n\n// ── 1. Validate customer details ─────────────────────────────\nif (input.name.length < 2) errors.push('Customer name is missing');\nelse if (input.name.length > 80 || /\\d/.test(input.name)) errors.push('Customer name looks invalid');\n\nif (!input.email) errors.push('Email address is missing');\nelse if (!/^[^\\s@]+@[^\\s@]+\\.[a-z]{2,}$/i.test(input.email)) errors.push('Email address is invalid');\n\n// Nigerian mobile numbers: 0803…, +234803…, 234803…  → stored as +234803…\nlet phone = null;\nconst digits = input.phone.replace(/[^\\d+]/g, '');\nconst local = digits.replace(/^\\+?234/, '').replace(/^0/, '');\nif (!input.phone) errors.push('Phone number is missing');\nelse if (!/^[789][01]\\d{8}$/.test(local)) errors.push('Phone number must be a valid Nigerian mobile number');\nelse phone = '+234' + local;\n\n// ── 2. Validate and price the items (prices come from the database) ──\nconst products = Object.fromEntries(productRows.map((p) => [p.id, p]));\nif (input.items.length === 0) errors.push('No products in the order');\nif (input.blank_lines > 0) errors.push('One or more order lines had no product');\n\nconst lines = [];\nfor (const { productId, quantity } of input.items) {\n  const p = products[productId];\n  if (!p || p.active === false) { errors.push(`Unknown product: ${productId}`); continue; }\n  if (!Number.isInteger(quantity) || quantity < 1) { errors.push(`Invalid quantity for ${p.name}`); continue; }\n\n  const unitPrice = Number(p.price);\n  lines.push({\n    product_id: p.id,\n    product_name: p.name,\n    quantity,\n    unit_price: unitPrice,\n    line_total: unitPrice * quantity,\n  });\n\n  // ── 3. Review checks (inventory + suspicious patterns) ──\n  if (quantity > Number(p.stock)) {\n    warnings.push(`Only ${p.stock} × ${p.name} in stock, customer requested ${quantity}`);\n    tags.add('INSUFFICIENT_STOCK');\n  }\n  if (quantity > MAX_QTY_PER_ITEM) {\n    warnings.push(`Unusually large quantity: ${quantity} × ${p.name}`);\n    tags.add('UNUSUAL_QUANTITY');\n  }\n}\n\nconst totalAmount = lines.reduce((sum, l) => sum + l.line_total, 0);\nconst totalQuantity = lines.reduce((sum, l) => sum + l.quantity, 0);\n\n// ── 4. Promotional bonus rule (₦500,000+ → 5%, pending until paid) ──\n//    An incomplete order can't be paid, so it earns no bonus.\nconst bonusEligible = errors.length === 0 && totalAmount >= BONUS_THRESHOLD;\nconst bonusAmount = bonusEligible ? Math.round(totalAmount * BONUS_RATE) : 0;\n\n// ── 5. More review checks using the customer's history ──\nif (totalAmount > UNUSUAL_ORDER_VALUE) {\n  warnings.push(`Order value above ₦${UNUSUAL_ORDER_VALUE.toLocaleString('en-NG')}`);\n  tags.add('UNUSUAL_ORDER_VALUE');\n}\nif (Number(history.recent_duplicates) > 0) {\n  warnings.push('Same customer submitted the same items in the last 10 minutes (possible duplicate)');\n  tags.add('POSSIBLE_DUPLICATE');\n}\nif (phone && history.last_phone && history.last_phone !== phone) {\n  warnings.push(`Phone number differs from this customer's previous order (${history.last_phone})`);\n  tags.add('DETAILS_MISMATCH');\n}\n\n// ── 6. Customer type ──\nconst previousOrders = Number(history.previous_orders ?? 0);\nlet customerType = 'NEW_CUSTOMER';\nif (previousOrders > 0) customerType = 'RETURNING_CUSTOMER';\nif (Number(history.lifetime_paid ?? 0) >= VIP_LIFETIME_PAID || Number(history.paid_orders ?? 0) >= VIP_PAID_ORDERS) {\n  customerType = 'VIP_CUSTOMER';\n}\n\n// ── 7. Route, statuses and tags ──\nlet route, orderStatus;\nif (errors.length > 0) {\n  route = 'incomplete';\n  orderStatus = 'INCOMPLETE';\n  tags.clear();               // review tags don't matter until the info is complete\n  tags.add('INCOMPLETE_ORDER');\n} else if (warnings.length > 0) {\n  route = 'review';\n  orderStatus = 'UNDER_REVIEW';\n  tags.add('REVIEW_REQUIRED');\n} else {\n  route = 'valid';\n  orderStatus = 'RECEIVED';\n}\nif (route !== 'incomplete') {\n  tags.add(bonusEligible ? 'HIGH_VALUE_ORDER' : 'STANDARD_ORDER');\n  tags.add(customerType);\n}\ntags.add('PAYMENT_PENDING');  // an order submission is NEVER a payment\n\n// ── 8. Unique order reference: VE-YYYYMMDD-XXXXX (Lagos date) ──\nconst lagosDate = new Date().toLocaleDateString('en-CA', { timeZone: 'Africa/Lagos' }).replace(/-/g, '');\nconst alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // no 0/O/1/I to avoid confusion\nlet suffix = '';\nfor (let i = 0; i < 5; i++) suffix += alphabet[Math.floor(Math.random() * alphabet.length)];\nconst orderRef = `VE-${lagosDate}-${suffix}`;\n\n// Tag order: classification first, then status, then extras\nconst order = ['INCOMPLETE_ORDER', 'HIGH_VALUE_ORDER', 'STANDARD_ORDER', 'REVIEW_REQUIRED', 'PAYMENT_PENDING'];\nconst sortedTags = [...tags].sort((a, b) => {\n  const ia = order.indexOf(a), ib = order.indexOf(b);\n  return (ia === -1 ? 99 : ia) - (ib === -1 ? 99 : ib);\n});\n\nreturn [{\n  json: {\n    route,                                  // valid | review | incomplete\n    order_ref: orderRef,\n    customer_name: input.name || null,\n    customer_email: input.email || null,\n    customer_phone: phone ?? (input.phone || null),\n    items: lines,\n    items_summary: lines.map((l) => `${l.product_name} × ${l.quantity}`).join(', ') || null,\n    total_quantity: totalQuantity,\n    total_amount: totalAmount,\n    bonus_eligible: bonusEligible,\n    bonus_amount: bonusAmount,\n    bonus_status: bonusEligible ? 'PENDING_PAYMENT' : 'NOT_ELIGIBLE',\n    payment_status: 'PAYMENT_PENDING',\n    order_status: orderStatus,\n    customer_type: route === 'incomplete' ? null : customerType,\n    tags: sortedTags,\n    errors,\n    warnings,\n    items_signature: input.signature,\n    received_at: input.received_at,\n    raw_payload: input.raw,\n  },\n}];\n"
+      }
+    },
+    {
+      "id": "c86fa154-40bd-45c3-8329-34d5924a5c28",
+      "name": "Compose Messages",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1100,
+        300
+      ],
+      "parameters": {
+        "jsCode": "// ─────────────────────────────────────────────────────────────\n// NODE: \"Compose Messages\"   (Code node · Run Once for All Items)\n// Builds the customer email, the Telegram alert, the website\n// response and the database record — all from the computed order.\n// Wording never claims payment or bonus activation (both pending).\n// ─────────────────────────────────────────────────────────────\nconst SITE_URL = 'https://YOUR-STORE.vercel.app';   // ← change to your deployed site URL\n\nconst o = $input.first().json;\nconst naira = (n) => '₦' + Number(n).toLocaleString('en-NG');\nconst esc = (s) => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');\nconst firstName = (o.customer_name || 'there').split(' ')[0];\nconst placedAt = new Date(o.received_at).toLocaleString('en-NG', {\n  timeZone: 'Africa/Lagos', dateStyle: 'medium', timeStyle: 'short',\n});\nconst payUrl = `${SITE_URL}/pay/${o.order_ref}`;\n\n// ── Human-readable statuses for the customer ──\nconst statusText = {\n  RECEIVED: 'Received, awaiting payment',\n  UNDER_REVIEW: 'Received, being checked by our team',\n  INCOMPLETE: 'Incomplete',\n}[o.order_status];\nconst paymentText = 'Not yet paid. We have not received a payment for this order.';\n\n// ── Bonus paragraph ──\nconst bonusHtml = o.bonus_eligible\n  ? `<p style=\"background:#ecfdf3;border:1px solid #abefc6;border-radius:8px;padding:12px 14px;margin:16px 0;\">\n       <strong>Promotional bonus: ${naira(o.bonus_amount)} store credit (pending)</strong><br>\n       Your order is ${naira(o.total_amount)}, so it qualifies for our 5% store-credit bonus on orders of ₦500,000 or more.\n       The bonus is <strong>pending</strong> and will only be activated after your payment has been verified.\n     </p>`\n  : `<p style=\"color:#555;margin:16px 0;\">\n       Promotional bonus: not eligible for this order. Orders of ₦500,000 or more earn a 5% store-credit bonus.\n     </p>`;\n\n// ── Next steps differ by route ──\nconst nextStepsHtml = o.route === 'valid'\n  ? `<p><strong>Next step:</strong> complete your payment securely with Paystack.</p>\n     <p><a href=\"${payUrl}\" style=\"display:inline-block;background:#0f172a;color:#fff;text-decoration:none;padding:12px 20px;border-radius:8px;font-weight:600;\">Pay ${naira(o.total_amount)} now</a></p>\n     <p style=\"color:#555;font-size:14px;\">We will email you again as soon as your payment is verified.</p>`\n  : `<p><strong>Next step:</strong> please <strong>do not make a payment yet</strong>. Our team needs to check one or more items in your order before it can proceed.\n     We will contact you by email or on ${esc(o.customer_phone)} once the check is complete.</p>`;\n\nconst rowsHtml = o.items.map((l) => `\n  <tr>\n    <td style=\"padding:8px;border-bottom:1px solid #eee;\">${esc(l.product_name)}</td>\n    <td style=\"padding:8px;border-bottom:1px solid #eee;text-align:center;\">${l.quantity}</td>\n    <td style=\"padding:8px;border-bottom:1px solid #eee;text-align:right;\">${naira(l.unit_price)}</td>\n    <td style=\"padding:8px;border-bottom:1px solid #eee;text-align:right;\">${naira(l.line_total)}</td>\n  </tr>`).join('');\n\nconst emailHtml = `\n<div style=\"font-family:Arial,Helvetica,sans-serif;max-width:600px;margin:0 auto;color:#111;line-height:1.5;\">\n  <h2 style=\"margin-bottom:4px;\">VoltEdge Electronics</h2>\n  <p style=\"color:#555;margin-top:0;\">Order confirmation</p>\n  <p>Hi ${esc(firstName)},</p>\n  <p>Thank you for your order. Here are the details we received on ${placedAt}.</p>\n  <table style=\"width:100%;border-collapse:collapse;font-size:14px;margin:16px 0;\">\n    <tr><td style=\"padding:4px 0;color:#555;\">Order reference</td><td style=\"padding:4px 0;\"><strong>${o.order_ref}</strong></td></tr>\n    <tr><td style=\"padding:4px 0;color:#555;\">Order status</td><td style=\"padding:4px 0;\">${statusText}</td></tr>\n    <tr><td style=\"padding:4px 0;color:#555;\">Payment status</td><td style=\"padding:4px 0;\">${paymentText}</td></tr>\n  </table>\n  <table style=\"width:100%;border-collapse:collapse;font-size:14px;\">\n    <tr style=\"background:#f5f5f5;\">\n      <th style=\"padding:8px;text-align:left;\">Product</th><th style=\"padding:8px;\">Qty</th>\n      <th style=\"padding:8px;text-align:right;\">Unit price</th><th style=\"padding:8px;text-align:right;\">Subtotal</th>\n    </tr>\n    ${rowsHtml}\n    <tr><td colspan=\"3\" style=\"padding:8px;text-align:right;\"><strong>Order total</strong></td>\n        <td style=\"padding:8px;text-align:right;\"><strong>${naira(o.total_amount)}</strong></td></tr>\n  </table>\n  ${bonusHtml}\n  ${nextStepsHtml}\n  <p>If anything above is wrong, simply reply to this email and quote <strong>${o.order_ref}</strong>.</p>\n  <p>Thank you for shopping with VoltEdge Electronics.</p>\n</div>`;\n\nconst emailSubject = o.route === 'valid'\n  ? `Order ${o.order_ref} received: ${naira(o.total_amount)} awaiting payment`\n  : `Order ${o.order_ref} received: our team is checking it`;\n\n// ── Telegram alert for the team (HTML parse mode) ──\nconst header = {\n  valid: '🛒 <b>New order</b>',\n  review: '⚠️ <b>New order: REVIEW REQUIRED</b>',\n  incomplete: '❌ <b>Incomplete order submission</b>',\n}[o.route];\n\nconst tg = [\n  `${header}  <code>${o.order_ref}</code>`,\n  '',\n  `<b>Customer:</b> ${esc(o.customer_name || '(missing)')}`,\n  `<b>Email:</b> ${esc(o.customer_email || '(missing)')}`,\n  `<b>Phone:</b> ${esc(o.customer_phone || '(missing)')}`,\n  `<b>Items:</b> ${esc(o.items_summary || '(none valid)')}`,\n  `<b>Total quantity:</b> ${o.total_quantity}`,\n  `<b>Total value:</b> ${naira(o.total_amount)}`,\n  `<b>Bonus:</b> ${o.bonus_eligible ? `${naira(o.bonus_amount)} (pending payment)` : 'Not eligible'}`,\n  `<b>Payment:</b> ${o.payment_status}`,\n  `<b>Order status:</b> ${o.order_status}`,\n  o.customer_type ? `<b>Customer type:</b> ${o.customer_type}` : null,\n  `<b>Tags:</b> ${o.tags.join(', ')}`,\n];\nif (o.errors.length) tg.push('', '<b>Missing / invalid:</b>', ...o.errors.map((e) => `• ${esc(e)}`));\nif (o.warnings.length) tg.push('', '<b>Needs review:</b>', ...o.warnings.map((w) => `• ${esc(w)}`));\nif (o.route === 'valid') tg.push('', 'No action needed until payment is confirmed.');\n\n// ── Response the website shows the customer ──\nconst response = o.route === 'incomplete'\n  ? { ok: false, orderRef: o.order_ref, errors: o.errors,\n      message: 'We could not process your order. Please correct the details below and try again.' }\n  : { ok: true, orderRef: o.order_ref, status: o.order_status, paymentStatus: o.payment_status,\n      total: o.total_amount, bonus: o.bonus_amount, canPay: o.route === 'valid',\n      message: o.route === 'valid'\n        ? 'Order received. Check your email for confirmation and payment instructions.'\n        : 'Order received. Our team will check it before payment. Please do not pay yet.' };\n\n// ── Record for the database (create_order function) ──\nconst dbRecord = {\n  order_ref: o.order_ref,\n  customer_name: o.customer_name,\n  customer_email: o.customer_email,\n  customer_phone: o.customer_phone,\n  items_summary: o.items_summary,\n  total_quantity: o.total_quantity,\n  total_amount: o.total_amount,\n  bonus_amount: o.bonus_amount,\n  bonus_status: o.bonus_status,\n  payment_status: o.payment_status,\n  order_status: o.order_status,\n  tags: o.tags,\n  warnings: [...o.errors, ...o.warnings],\n  customer_type: o.customer_type,\n  items_signature: o.items_signature,\n  items: o.items,\n  raw_payload: o.raw_payload,\n};\n\nreturn [{\n  json: {\n    ...o,\n    email_subject: emailSubject,\n    email_html: emailHtml,\n    telegram_text: tg.filter((line) => line !== null).join('\\n'),\n    response,\n    db_record: dbRecord,\n  },\n}];\n"
+      }
+    },
+    {
+      "id": "9ba9355b-3c60-48e8-9682-132044049ea8",
+      "name": "Route Order",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [
+        1320,
+        300
+      ],
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "loose",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "1de381b7-5277-47eb-ba1a-e3a36def51a0",
+                    "leftValue": "={{ $json.route }}",
+                    "rightValue": "valid",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Valid"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "loose",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "9349be48-76a0-470e-a99e-35ffab0d1f8f",
+                    "leftValue": "={{ $json.route }}",
+                    "rightValue": "review",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Needs review"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "loose",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "2928ef39-978c-4862-b415-7d0dbe5559d8",
+                    "leftValue": "={{ $json.route }}",
+                    "rightValue": "incomplete",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Incomplete"
+            }
+          ]
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "81bea83d-c575-4610-b669-16b375c3b377",
+      "name": "Save Order",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1580,
+        200
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Saves the order + its items in one transaction (see create_order in schema.sql)\nselect * from create_order($1::jsonb);",
+        "options": {
+          "queryReplacement": "={{ [ JSON.stringify($('Compose Messages').first().json.db_record) ] }}"
+        }
+      }
+    },
+    {
+      "id": "aa04e868-d347-4a72-b59d-c0125627d290",
+      "name": "Respond Success",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        1800,
+        200
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ $('Compose Messages').first().json.response }}",
+        "options": {}
+      }
+    },
+    {
+      "id": "3874e496-386d-43e6-84f6-667b8c7cb0cf",
+      "name": "Email Customer",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        2020,
+        200
+      ],
+      "onError": "continueRegularOutput",
+      "parameters": {
+        "sendTo": "={{ $('Compose Messages').first().json.customer_email }}",
+        "subject": "={{ $('Compose Messages').first().json.email_subject }}",
+        "emailType": "html",
+        "message": "={{ $('Compose Messages').first().json.email_html }}",
+        "options": {
+          "appendAttribution": false,
+          "senderName": "VoltEdge Electronics"
+        }
+      }
+    },
+    {
+      "id": "f24b95f9-2f44-4113-9b67-9e0f105ab521",
+      "name": "Notify Team",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        2240,
+        200
+      ],
+      "onError": "continueRegularOutput",
+      "parameters": {
+        "chatId": "YOUR_TELEGRAM_CHAT_ID",
+        "text": "={{ $('Compose Messages').first().json.telegram_text }}",
+        "additionalFields": {
+          "appendAttribution": false,
+          "parse_mode": "HTML"
+        }
+      }
+    },
+    {
+      "id": "5b056a14-9712-4475-ad04-af7281f4c867",
+      "name": "Save Incomplete",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1580,
+        460
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Saves the order + its items in one transaction (see create_order in schema.sql)\nselect * from create_order($1::jsonb);",
+        "options": {
+          "queryReplacement": "={{ [ JSON.stringify($('Compose Messages').first().json.db_record) ] }}"
+        }
+      }
+    },
+    {
+      "id": "63f6e75c-a204-4d46-90ed-762f1199c61d",
+      "name": "Respond Error",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        1800,
+        460
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ $('Compose Messages').first().json.response }}",
+        "options": {
+          "responseCode": 400
+        }
+      }
+    },
+    {
+      "id": "02ac65e4-78a7-44d5-bdcc-fa9f03c8ca5d",
+      "name": "Alert Team",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        2020,
+        460
+      ],
+      "onError": "continueRegularOutput",
+      "parameters": {
+        "chatId": "YOUR_TELEGRAM_CHAT_ID",
+        "text": "={{ $('Compose Messages').first().json.telegram_text }}",
+        "additionalFields": {
+          "appendAttribution": false,
+          "parse_mode": "HTML"
+        }
+      }
+    },
+    {
+      "id": "963564d6-bbfa-4768-89ea-70f2ded6e0ea",
+      "name": "Note 956dg",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -40,
+        120
+      ],
+      "parameters": {
+        "content": "## 1. Receive & clean\nWebhook (protected by a secret header) → tidy the input.",
+        "width": 420,
+        "height": 340
+      }
+    },
+    {
+      "id": "6972eb60-e699-4a25-879e-80b9ee96bd80",
+      "name": "Note erqya",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        400,
+        120
+      ],
+      "parameters": {
+        "content": "## 2. Look up facts\nPrices + stock from the database, never from the browser. Customer history for duplicate / returning checks.",
+        "width": 440,
+        "height": 340
+      }
+    },
+    {
+      "id": "33dab12a-e122-4f81-a57e-0adaeb8e4f86",
+      "name": "Note 41ghg",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        840,
+        120
+      ],
+      "parameters": {
+        "content": "## 3. Apply business rules\nValidation, totals, 5% bonus (≥ ₦500k), review checks, tags, order reference. Deterministic code only.",
+        "width": 600,
+        "height": 340
+      }
+    },
+    {
+      "id": "a8904e25-d043-4fd5-8ba3-8db48682b242",
+      "name": "Note 4pcwm",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        1540,
+        40
+      ],
+      "parameters": {
+        "content": "## 4. Save → respond → notify\nValid and review orders share one path; the message wording differs. Email/Telegram failures never block the order.",
+        "width": 860,
+        "height": 300
+      }
+    },
+    {
+      "id": "fd2a68a7-f831-412a-91f0-fde20aea3bc6",
+      "name": "Note 4xyaq",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        1540,
+        380
+      ],
+      "parameters": {
+        "content": "## 5. Incomplete orders\nStill saved (audit trail), website shows what to fix, team is alerted.",
+        "width": 640,
+        "height": 240
+      }
+    }
+  ],
+  "connections": {
+    "Webhook": {
+      "main": [
+        [
+          {
+            "node": "Normalize Input",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize Input": {
+      "main": [
+        [
+          {
+            "node": "Get Products",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Products": {
+      "main": [
+        [
+          {
+            "node": "Get Customer History",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Customer History": {
+      "main": [
+        [
+          {
+            "node": "Process Order",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Process Order": {
+      "main": [
+        [
+          {
+            "node": "Compose Messages",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Compose Messages": {
+      "main": [
+        [
+          {
+            "node": "Route Order",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route Order": {
+      "main": [
+        [
+          {
+            "node": "Save Order",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Save Order",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Save Incomplete",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save Order": {
+      "main": [
+        [
+          {
+            "node": "Respond Success",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Respond Success": {
+      "main": [
+        [
+          {
+            "node": "Email Customer",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Email Customer": {
+      "main": [
+        [
+          {
+            "node": "Notify Team",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save Incomplete": {
+      "main": [
+        [
+          {
+            "node": "Respond Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Respond Error": {
+      "main": [
+        [
+          {
+            "node": "Alert Team",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "Africa/Lagos"
+  },
+  "pinData": {}
+}

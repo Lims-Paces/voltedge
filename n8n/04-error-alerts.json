@@ -1,0 +1,53 @@
+{
+  "name": "VoltEdge · 04 Error Alerts",
+  "nodes": [
+    {
+      "id": "ee7d9495-3044-4e92-97e3-a54e70a3c08a",
+      "name": "Error Trigger",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        300
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "69237c02-2688-460c-96e7-fdf316dd035e",
+      "name": "Alert Team",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        220,
+        300
+      ],
+      "onError": "continueRegularOutput",
+      "parameters": {
+        "chatId": "YOUR_TELEGRAM_CHAT_ID",
+        "text": "=🚨 <b>Automation error</b>\nWorkflow: {{ $json.workflow.name }}\nFailed node: {{ $json.execution.lastNodeExecuted }}\nError: {{ ($json.execution.error?.message ?? 'unknown').replace(/</g, '&lt;') }}\n{{ $json.execution.url ? 'Execution: ' + $json.execution.url : '' }}",
+        "additionalFields": {
+          "appendAttribution": false,
+          "parse_mode": "HTML"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Error Trigger": {
+      "main": [
+        [
+          {
+            "node": "Alert Team",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "Africa/Lagos"
+  },
+  "pinData": {}
+}

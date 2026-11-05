@@ -1,0 +1,427 @@
+{
+  "name": "VoltEdge · 02 Payment Confirmation",
+  "nodes": [
+    {
+      "id": "0f918b9a-3bb8-4a4c-b562-a0fb51cd095e",
+      "name": "Paystack Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        300
+      ],
+      "webhookId": "b79bd948-4675-4e4a-8eb3-f295484cc116",
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "voltedge-paystack",
+        "options": {}
+      }
+    },
+    {
+      "id": "464575d2-85b9-4d66-a3d5-0e1be403c2a6",
+      "name": "Is charge.success?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        220,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "f03c9834-b408-45c2-8b24-13405215797a",
+              "leftValue": "={{ $json.body.event }}",
+              "rightValue": "charge.success",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      }
+    },
+    {
+      "id": "68c13029-438e-47d9-ba68-d6311b0968fc",
+      "name": "Verify with Paystack",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        440,
+        280
+      ],
+      "parameters": {
+        "url": "=https://api.paystack.co/transaction/verify/{{ encodeURIComponent($json.body.data.reference) }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {}
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "id": "04778aed-a8fe-4a1d-8b28-b999fa81b286",
+      "name": "Check Verification",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        660,
+        280
+      ],
+      "parameters": {
+        "jsCode": "// ─────────────────────────────────────────────────────────────\n// NODE: \"Check Verification\"   (Code node · Run Once for All Items)\n// Workflow 02. Reads Paystack's VERIFY API answer (not the webhook body)\n// and decides, deterministically, whether this payment is real.\n// ─────────────────────────────────────────────────────────────\nconst webhook = $('Paystack Webhook').first().json.body ?? {};\nconst reference = webhook.data?.reference ?? '';\nconst v = $input.first().json;            // response from GET /transaction/verify/:reference\nconst tx = v.data ?? {};\n\nlet reason = null;\nif (v.error) reason = 'Could not reach Paystack verify API';\nelse if (v.status !== true) reason = v.message || 'Paystack did not confirm the transaction';\nelse if (tx.status !== 'success') reason = `Transaction status is \"${tx.status}\"`;\nelse if (tx.currency !== 'NGN') reason = `Unexpected currency ${tx.currency}`;\nelse if (tx.reference !== reference) reason = 'Reference mismatch between webhook and verify API';\n\n// The order reference was sent in metadata; the Paystack reference is \"<order_ref>_<timestamp>\"\nconst orderRef = tx.metadata?.order_ref || String(tx.reference ?? reference).split('_')[0];\n\nreturn [{\n  json: {\n    verified: reason === null,\n    reason,\n    reference,\n    order_ref: orderRef,\n    amount_kobo: Number(tx.amount ?? 0),\n    paid_at: tx.paid_at ?? null,\n    channel: tx.channel ?? null,\n  },\n}];\n"
+      }
+    },
+    {
+      "id": "956e3577-1b56-48e2-a487-79cdc832bfdb",
+      "name": "Verified?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        880,
+        280
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "bd9b1e6e-d967-4f45-82fa-b8e9d18cdc84",
+              "leftValue": "={{ $json.verified }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      }
+    },
+    {
+      "id": "4ebbd877-8418-437f-8ba9-588f8c77e88d",
+      "name": "Confirm Payment",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1100,
+        200
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Marks the order paid, activates the bonus, reduces stock (see confirm_payment in schema.sql)\nselect confirm_payment($1, $2, $3::bigint) as result;",
+        "options": {
+          "queryReplacement": "={{ [ $json.order_ref, $json.reference, $json.amount_kobo ] }}"
+        }
+      }
+    },
+    {
+      "id": "b31714c5-d1e3-471d-8588-0d50b3a12ad9",
+      "name": "Compose Payment Messages",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1320,
+        200
+      ],
+      "parameters": {
+        "jsCode": "// ─────────────────────────────────────────────────────────────\n// NODE: \"Compose Payment Messages\"   (Code node · Run Once for All Items)\n// Workflow 02. Runs after confirm_payment() in the database.\n// Only a CONFIRMED result produces a \"payment received\" email.\n// ─────────────────────────────────────────────────────────────\nconst raw = $input.first().json.result;\nconst r = typeof raw === 'string' ? JSON.parse(raw) : raw;   // the DB returns jsonb\nconst v = $('Check Verification').first().json;\nconst naira = (n) => '₦' + Number(n).toLocaleString('en-NG');\nconst esc = (s) => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');\n\nif (r.result === 'ALREADY_CONFIRMED') {\n  return [];   // Paystack re-sent the webhook; nothing to do (stops quietly)\n}\n\nif (r.result !== 'CONFIRMED') {\n  const why = r.result === 'AMOUNT_MISMATCH'\n    ? `Paid ${naira(r.paid)} but the order total is ${naira(r.expected)}. Order moved to UNDER_REVIEW.`\n    : `No order found for reference ${esc(r.order_ref)}.`;\n  return [{\n    json: {\n      result: 'PROBLEM',\n      telegram_text: `⚠️ <b>Payment needs attention</b>  <code>${esc(r.order_ref)}</code>\\n${why}\\nPaystack ref: <code>${esc(v.reference)}</code>`,\n    },\n  }];\n}\n\nconst firstName = (r.customer_name || 'there').split(' ')[0];\nconst bonusHtml = Number(r.bonus_amount) > 0\n  ? `<p style=\"background:#ecfdf3;border:1px solid #abefc6;border-radius:8px;padding:12px 14px;\">\n       <strong>Your ${naira(r.bonus_amount)} promotional store credit is now active.</strong>\n     </p>`\n  : '';\n\nconst emailHtml = `\n<div style=\"font-family:Arial,Helvetica,sans-serif;max-width:600px;margin:0 auto;color:#111;line-height:1.5;\">\n  <h2 style=\"margin-bottom:4px;\">VoltEdge Electronics</h2>\n  <p style=\"color:#555;margin-top:0;\">Payment confirmation</p>\n  <p>Hi ${esc(firstName)},</p>\n  <p>We have received and verified your payment of <strong>${naira(r.total_amount)}</strong> for order <strong>${r.order_ref}</strong>.</p>\n  <table style=\"width:100%;border-collapse:collapse;font-size:14px;margin:16px 0;\">\n    <tr><td style=\"padding:4px 0;color:#555;\">Items</td><td>${esc(r.items_summary)}</td></tr>\n    <tr><td style=\"padding:4px 0;color:#555;\">Order status</td><td>Confirmed</td></tr>\n    <tr><td style=\"padding:4px 0;color:#555;\">Payment status</td><td>Paid (verified by Paystack)</td></tr>\n    <tr><td style=\"padding:4px 0;color:#555;\">Payment reference</td><td>${esc(r.payment_reference)}</td></tr>\n  </table>\n  ${bonusHtml}\n  <p><strong>Next step:</strong> our team will contact you to arrange delivery.</p>\n  <p>Thank you for shopping with VoltEdge Electronics.</p>\n</div>`;\n\nreturn [{\n  json: {\n    result: 'CONFIRMED',\n    customer_email: r.customer_email,\n    email_subject: `Payment received for order ${r.order_ref}`,\n    email_html: emailHtml,\n    telegram_text: [\n      `✅ <b>Payment confirmed</b>  <code>${r.order_ref}</code>`,\n      '',\n      `<b>Customer:</b> ${esc(r.customer_name)} (${esc(r.customer_email)})`,\n      `<b>Items:</b> ${esc(r.items_summary)}`,\n      `<b>Amount verified:</b> ${naira(r.total_amount)}`,\n      `<b>Bonus:</b> ${Number(r.bonus_amount) > 0 ? `${naira(r.bonus_amount)} now ACTIVE` : 'Not eligible'}`,\n      `<b>Tags:</b> ${r.tags.join(', ')}`,\n      '',\n      'Ready for fulfilment.',\n    ].join('\\n'),\n  },\n}];\n"
+      }
+    },
+    {
+      "id": "a2833451-a68c-41ca-85d3-879f69ad0521",
+      "name": "Result",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [
+        1540,
+        200
+      ],
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "loose",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "742a03d4-73a2-428d-805a-6eebaaa5f0bc",
+                    "leftValue": "={{ $json.result }}",
+                    "rightValue": "CONFIRMED",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Confirmed"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "loose",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "7947be29-3d36-4b79-9e1e-7196e7c4f9c5",
+                    "leftValue": "={{ $json.result }}",
+                    "rightValue": "PROBLEM",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Problem"
+            }
+          ]
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "78323bc1-2535-4f97-9fe2-eae7898cc7fa",
+      "name": "Email Payment Confirmed",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        1780,
+        100
+      ],
+      "onError": "continueRegularOutput",
+      "parameters": {
+        "sendTo": "={{ $json.customer_email }}",
+        "subject": "={{ $json.email_subject }}",
+        "emailType": "html",
+        "message": "={{ $json.email_html }}",
+        "options": {
+          "appendAttribution": false,
+          "senderName": "VoltEdge Electronics"
+        }
+      }
+    },
+    {
+      "id": "d3cb4223-988b-4318-84e0-0f9a224fade0",
+      "name": "Notify Team: Paid",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        2000,
+        100
+      ],
+      "onError": "continueRegularOutput",
+      "parameters": {
+        "chatId": "YOUR_TELEGRAM_CHAT_ID",
+        "text": "={{ $('Compose Payment Messages').first().json.telegram_text }}",
+        "additionalFields": {
+          "appendAttribution": false,
+          "parse_mode": "HTML"
+        }
+      }
+    },
+    {
+      "id": "a6b1c228-d7bb-4be4-a689-b47d397e361c",
+      "name": "Alert Team: Payment Problem",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1780,
+        300
+      ],
+      "onError": "continueRegularOutput",
+      "parameters": {
+        "chatId": "YOUR_TELEGRAM_CHAT_ID",
+        "text": "={{ $json.telegram_text }}",
+        "additionalFields": {
+          "appendAttribution": false,
+          "parse_mode": "HTML"
+        }
+      }
+    },
+    {
+      "id": "43c96237-b342-4f78-96e7-661c3e5a52bd",
+      "name": "Alert Team: Unverified",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1100,
+        420
+      ],
+      "onError": "continueRegularOutput",
+      "parameters": {
+        "chatId": "YOUR_TELEGRAM_CHAT_ID",
+        "text": "=⚠️ <b>Paystack webhook could not be verified</b>\nReference: <code>{{ $json.reference }}</code>\nReason: {{ $json.reason }}\nNo order was changed.",
+        "additionalFields": {
+          "appendAttribution": false,
+          "parse_mode": "HTML"
+        }
+      }
+    },
+    {
+      "id": "0c9952bc-701d-4210-a418-9c1e53169f2a",
+      "name": "Note b6nrn",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        380,
+        100
+      ],
+      "parameters": {
+        "content": "## Payment ≠ order\nOnly Paystack's verify API can mark an order paid. The webhook body alone is never trusted.",
+        "width": 460,
+        "height": 160
+      }
+    }
+  ],
+  "connections": {
+    "Paystack Webhook": {
+      "main": [
+        [
+          {
+            "node": "Is charge.success?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is charge.success?": {
+      "main": [
+        [
+          {
+            "node": "Verify with Paystack",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Verify with Paystack": {
+      "main": [
+        [
+          {
+            "node": "Check Verification",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check Verification": {
+      "main": [
+        [
+          {
+            "node": "Verified?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Verified?": {
+      "main": [
+        [
+          {
+            "node": "Confirm Payment",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Alert Team: Unverified",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Confirm Payment": {
+      "main": [
+        [
+          {
+            "node": "Compose Payment Messages",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Compose Payment Messages": {
+      "main": [
+        [
+          {
+            "node": "Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Result": {
+      "main": [
+        [
+          {
+            "node": "Email Payment Confirmed",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Alert Team: Payment Problem",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Email Payment Confirmed": {
+      "main": [
+        [
+          {
+            "node": "Notify Team: Paid",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "Africa/Lagos"
+  },
+  "pinData": {}
+}
