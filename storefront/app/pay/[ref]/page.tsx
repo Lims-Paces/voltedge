@@ -1,3 +1,4 @@
+import SimpleHeader from "@/app/components/SimpleHeader";
 import { supabaseAdmin, naira, type OrderRow } from "@/lib/supabase";
 
 export const dynamic = "force-dynamic";
@@ -25,13 +26,13 @@ export default async function PayPage({
     .eq("order_ref", ref)
     .maybeSingle<OrderRow>();
 
-  if (!order) return <section className="panel success"><h2>Order not found</h2><p>Check the reference in your email.</p></section>;
+  if (!order) return <><SimpleHeader /><main className="page"><section className="panel success"><h2>Order not found</h2><p>Check the reference in your email.</p></section></main></>;
 
   const paid = order.payment_status === "PAYMENT_CONFIRMED";
   const payable = !paid && order.order_status === "RECEIVED";
 
   return (
-    <section className="panel success">
+    <><SimpleHeader /><main className="page"><section className="panel success">
       <h2>Order {order.order_ref}</h2>
       {error && <p className="notice error">{ERRORS[error] ?? "Something went wrong."}</p>}
       <ul className="facts">
@@ -51,6 +52,6 @@ export default async function PayPage({
         </form>
       )}
       {!payable && !paid && <p className="notice">{ERRORS.not_payable}</p>}
-    </section>
+    </section></main></>
   );
 }

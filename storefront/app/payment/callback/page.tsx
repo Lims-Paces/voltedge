@@ -1,3 +1,4 @@
+import SimpleHeader from "@/app/components/SimpleHeader";
 import { supabaseAdmin, naira, type OrderRow } from "@/lib/supabase";
 
 export const dynamic = "force-dynamic";
@@ -22,7 +23,7 @@ export default async function PaymentCallback({
   const confirmed = order?.payment_status === "PAYMENT_CONFIRMED";
 
   return (
-    <section className="panel success">
+    <><SimpleHeader /><main className="page"><section className="panel success">
       <h2>{confirmed ? "Payment verified ✅" : "Verifying your payment…"}</h2>
       {order && <p>Order <strong>{order.order_ref}</strong> · {naira(order.total_amount)}</p>}
       {confirmed ? (
@@ -38,6 +39,6 @@ export default async function PaymentCallback({
         </p>
       )}
       <a className="btn ghost" href="/">Back to store</a>
-    </section>
+    </section></main></>
   );
 }
